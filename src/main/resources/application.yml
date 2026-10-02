@@ -1,0 +1,38 @@
+# All deploy-time config comes from env vars (OPS-04); defaults match docker-compose.yml.
+server:
+  port: ${PORT:8080}
+  shutdown: graceful
+
+spring:
+  application:
+    name: ts-ticketing-system
+  threads:
+    virtual:
+      enabled: true                       # NFR-06
+  datasource:
+    url: ${DATABASE_URL:jdbc:mysql://localhost:3307/ticketing}
+    username: ${DATABASE_USERNAME:ticketing}
+    password: ${DATABASE_PASSWORD:ticketing}
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:10}   # NFR-05: stay within the DB plan's connection limit
+      minimum-idle: ${DB_POOL_MIN_IDLE:2}
+      connection-timeout: 30000
+      transaction-isolation: TRANSACTION_READ_COMMITTED   # NFR-11
+      # The pool must not fail app startup: readiness reports the DB state instead (NFR-09).
+      initialization-fail-timeout: -1
+
+# Only the Prometheus scrape is exposed, at /metrics (FR-07). Health is served by
+# HealthController at /health/live and /health/ready (FR-06).
+management:
+  endpoints:
+    web:
+      base-path: /
+      discovery:
+        enabled: false
+      exposure:
+        include: prometheus
+      path-mapping:
+        prometheus: metrics
+  endpoint:
+    health:
+      enabled: false
