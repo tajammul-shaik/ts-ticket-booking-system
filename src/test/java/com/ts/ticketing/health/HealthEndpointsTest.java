@@ -2,6 +2,8 @@ package com.ts.ticketing.health;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.time.Duration;
+
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -12,6 +14,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ResponseEntity;
 import org.testcontainers.containers.MySQLContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -34,9 +37,11 @@ class HealthEndpointsTest {
 
     @Test
     @Order(1)
-    void liveAndReadyWhenDatabaseIsUp() {
+    void liveAndReadyWhenDatabaseIsUp() throws InterruptedException {
         assertThat(http.getForEntity("/health/live", String.class).getStatusCode()).isEqualTo(HttpStatus.OK);
-        assertThat(http.getForEntity("/health/ready", String.class).getStatusCode()).isEqualTo(HttpStatus.OK);
+        // Like an orchestrator, wait for readiness: the pool's first connection can take
+        // longer than the probe's 2 s deadline on a slow Docker host.
+        assertThat(awaitReady(Duration.ofSeconds(60))).isEqualTo(HttpStatus.OK);
     }
 
     @Test
@@ -45,6 +50,16 @@ class HealthEndpointsTest {
         ResponseEntity<String> res = http.getForEntity("/metrics", String.class);
         assertThat(res.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(res.getBody()).contains("hikaricp_connections_pending");
+    }
+
+    private HttpStatusCode awaitReady(Duration timeout) throws InterruptedException {
+        long deadline = System.nanoTime() + timeout.toNanos();
+        HttpStatusCode status;
+        while ((status = http.getForEntity("/health/ready", String.class).getStatusCode()) != HttpStatus.OK
+                && System.nanoTime() < deadline) {
+            Thread.sleep(500);
+        }
+        return status;
     }
 
     @Test

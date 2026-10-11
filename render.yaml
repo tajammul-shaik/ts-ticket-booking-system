@@ -1,0 +1,42 @@
+# Render Blueprint: the application as ONE free web service. The database is an external MySQL
+# (Aiven's free plan), because Render has no managed MySQL. DEPLOYMENT.md walks through it.
+#
+# Render dashboard → New → Blueprint → this repository. Render asks for the values marked
+# sync: false and generates the secrets.
+services:
+  - type: web
+    name: ts-ticketing
+    runtime: docker
+    plan: free                      # 512 MB, 0.1 CPU, sleeps after 15 min idle
+    # Choose the Render region closest to your Aiven MySQL region; every query crosses between them.
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health/ready  # 200 only when the database is reachable
+    envVars:
+      # Generated once by Render (random 256-bit, base64). To read ADMIN_SECRET for burst.sh:
+      # open the service → Environment.
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_SECRET
+        generateValue: true
+      # From Aiven: jdbc:mysql://<host>:<port>/defaultdb?sslMode=REQUIRED, user avnadmin
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_USERNAME
+        sync: false
+      - key: DATABASE_PASSWORD
+        sync: false
+      # Sized for Aiven's free plan (few connections) and 0.1 CPU. A reserve call that can't get
+      # a slot waits up to 30 s instead of 5 s, so a slow CPU produces queueing, not 429s.
+      # Measured: burst 33/33 at 0.1 CPU (LOAD-TESTING.md §11).
+      - key: DB_POOL_SIZE
+        value: "5"
+      - key: ADMISSION_MAX_IN_FLIGHT
+        value: "32"
+      - key: ADMISSION_ACQUIRE_TIMEOUT
+        value: 30s
+      # Every request reaches the app through Render's proxy, so the TCP peer is the proxy;
+      # the anonymous (token endpoint) rate limit must key on X-Forwarded-For instead.
+      - key: RATE_LIMIT_TRUST_FORWARDED_FOR
+        value: "true"

@@ -1,0 +1,9 @@
+**/target/
+.git/
+.idea/
+.vscode/
+*.docx
+.env
+.burst-venv/
+**/__pycache__/
+loadtest/

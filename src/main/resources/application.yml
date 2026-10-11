@@ -1,25 +1,104 @@
-# All deploy-time config comes from env vars (OPS-04); defaults match docker-compose.yml.
+# ts-ticketing-system: all configuration. Environment-specific values and secrets come from env
+# vars through ${VAR:default}; application-prod.yml (the Docker image's profile) removes the
+# local-only defaults.
+#
+# A required secret is ${VAR:} (empty fallback), never ${VAR}: an unresolved ${VAR} binds as the
+# literal text "${VAR}", which passes @NotBlank and becomes a publicly known key (CLAUDE.md lesson 1).
+
 server:
-  port: ${PORT:8080}
+  port: ${PORT:8080}                          # Render sets PORT
   shutdown: graceful
+  tomcat:
+    # Connections the JVM holds at once. Each request in flight costs ~110 KB of heap (Tomcat's
+    # request buffers plus the parked virtual thread's stack), so this is the memory bound in a
+    # 512 MB container (LOAD-TESTING.md §5.5): 1,000 fits; 4,000 ran the heap out. Further
+    # connections wait in the kernel accept backlog, which costs no heap.
+    max-connections: ${TOMCAT_MAX_CONNECTIONS:1000}
+    accept-count: ${TOMCAT_ACCEPT_COUNT:4096}
+    # Rotate keep-alive connections so backlogged ones get a turn instead of starving.
+    max-keep-alive-requests: ${TOMCAT_MAX_KEEP_ALIVE_REQUESTS:25}
 
 spring:
   application:
-    name: ts-ticketing-system
+    name: ts-ticketing
+  lifecycle:
+    timeout-per-shutdown-phase: 20s           # in-flight reservations finish before the JVM exits
   threads:
     virtual:
-      enabled: true                       # NFR-06
+      enabled: true                           # NFR-06: a blocked JDBC call parks a virtual thread
+  jackson:
+    property-naming-strategy: SNAKE_CASE      # JSON fields are user_id, price_paise, ...
+    # Money is integer paise (BR-13): 250.5 or "25000" must be a 400, never silently become 250.
+    deserialization:
+      accept-float-as-int: false
+    mapper:
+      allow-coercion-of-scalars: false
   datasource:
-    url: ${DATABASE_URL:jdbc:mysql://localhost:3307/ticketing}
+    # Local default = the compose MySQL as seen from the host (IDE runs). application-prod.yml
+    # removes it: there, DATABASE_URL must be set (Aiven: jdbc:mysql://<host>:<port>/defaultdb?sslMode=REQUIRED).
+    url: ${DATABASE_URL:jdbc:mysql://localhost:3308/ticketing}
     username: ${DATABASE_USERNAME:ticketing}
     password: ${DATABASE_PASSWORD:ticketing}
     hikari:
-      maximum-pool-size: ${DB_POOL_SIZE:10}   # NFR-05: stay within the DB plan's connection limit
+      maximum-pool-size: ${DB_POOL_SIZE:10}   # NFR-05: within the DB plan's connection limit
       minimum-idle: ${DB_POOL_MIN_IDLE:2}
       connection-timeout: 30000
+      # A hosted database (Aiven) sits behind NAT and proxies that drop idle TCP connections;
+      # ping idle ones and recycle all of them well before MySQL's wait_timeout.
+      keepalive-time: 60000
+      max-lifetime: 1500000
       transaction-isolation: TRANSACTION_READ_COMMITTED   # NFR-11
-      # The pool must not fail app startup: readiness reports the DB state instead (NFR-09).
+      # A lock wait longer than this is error 1205 (retried, then 429) instead of a 50 s stall.
+      connection-init-sql: SET SESSION innodb_lock_wait_timeout = ${DB_LOCK_WAIT_TIMEOUT_SECONDS:10}
+      # The pool doesn't fail startup; Flyway does need the DB at boot, so the port opens only
+      # once the schema is migrated (FR-06, OPS-05).
       initialization-fail-timeout: -1
+      # Connector/J round trips matter when the database is in another data centre: each
+      # avoided statement saves one network round trip per transaction.
+      data-source-properties:
+        cachePrepStmts: true                  # parse each SQL shape once per connection
+        prepStmtCacheSize: 250
+        prepStmtCacheSqlLimit: 2048
+        useServerPrepStmts: true
+        useLocalSessionState: true            # no SELECT @@tx_isolation / autocommit probes
+        elideSetAutoCommits: true             # no SET autocommit when it's already that value
+        cacheServerConfiguration: true        # server variables read once, not per connection
+        cacheResultSetMetadata: true
+        rewriteBatchedStatements: true
+        maintainTimeStats: false
+  flyway:
+    locations: classpath:db/migration         # V1__init.sql (BRD section 10)
+
+app:
+  jwt:
+    # HS256 signing key; the app refuses to start without it (NFR-10).
+    secret: ${JWT_SECRET:}
+    token-ttl: ${TOKEN_TTL:24h}
+  identity:
+    admin-secret: ${ADMIN_SECRET:}            # X-Admin-Secret that yields an admin token
+  edge:
+    rate-limit:
+      # Token bucket per caller: the user id from a valid token, else the client IP.
+      # replenish-rate = tokens added per second, burst-capacity = bucket size.
+      enabled: ${RATE_LIMIT_ENABLED:true}
+      user-replenish-rate: ${RATE_LIMIT_USER_RATE:20}
+      user-burst-capacity: ${RATE_LIMIT_USER_BURST:40}
+      # Unauthenticated calls (token requests) are keyed by IP. Generous by default: a load test
+      # mints thousands of tokens from one machine.
+      anonymous-replenish-rate: ${RATE_LIMIT_ANON_RATE:2000}
+      anonymous-burst-capacity: ${RATE_LIMIT_ANON_BURST:5000}
+      # Trust X-Forwarded-For only behind a proxy you control (Render's edge sets it).
+      trust-forwarded-for: ${RATE_LIMIT_TRUST_FORWARDED_FOR:false}
+    validation:
+      max-body-bytes: ${MAX_BODY_BYTES:524288}   # 512 KB: a 10,000-seat show fits
+  admission:
+    # NFR-04: reserve calls doing DB work at once (≈ 4-8 × pool), how many may wait for a slot,
+    # and how long they wait before 429 overloaded.
+    max-in-flight: ${ADMISSION_MAX_IN_FLIGHT:64}
+    max-queued: ${ADMISSION_MAX_QUEUED:1000}
+    acquire-timeout: ${ADMISSION_ACQUIRE_TIMEOUT:5s}
+  metrics:
+    seat-gauge-max-age: ${SEAT_GAUGE_MAX_AGE:500ms}
 
 # Only the Prometheus scrape is exposed, at /metrics (FR-07). Health is served by
 # HealthController at /health/live and /health/ready (FR-06).
@@ -36,3 +115,16 @@ management:
   endpoint:
     health:
       enabled: false
+  observations:
+    enable:
+      # Spring Security would wrap every filter of every request in an observation: thousands of
+      # extra objects under a burst, for spans nobody exports. http_server_requests is unaffected.
+      spring.security: false
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true            # p99 latency can be computed and alerted on
+
+logging:
+  level:
+    com.ts.ticketing: DEBUG

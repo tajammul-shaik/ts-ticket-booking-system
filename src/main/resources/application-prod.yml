@@ -1,0 +1,12 @@
+# prod profile (the Docker image runs it): no local fallbacks for the database, so a missing
+# DATABASE_URL fails startup instead of silently pointing at localhost. JSON log lines come from
+# logback-spring.xml.
+spring:
+  datasource:
+    url: ${DATABASE_URL:}
+    username: ${DATABASE_USERNAME:}
+    password: ${DATABASE_PASSWORD:}
+
+logging:
+  level:
+    com.ts.ticketing: INFO
